@@ -10,14 +10,66 @@ const Game = (() => {
 
   // ---------- constants ----------
   const COLS = 8, ROWS = 10;
-  const LANE_LEN = 1000;          // logical battlefield width
+  // battlefield "width": only affects how long a unit takes to walk from
+  // base to base (toScreenX below normalizes by LANE_LEN, so the UI never
+  // gets visually wider/longer — only travel time changes).
+  const LANE_LEN = 1500;
   const BASE_MAX_HP = 3000;
 
-  const UNIT_DEFS = {
-    swordsman: { hp: 100, atk: 15, speed: 46, range: 16,  cooldown: 0.8, color: '#e5484d', radius: 11 },
-    archer:    { hp: 40,  atk: 25, speed: 24, range: 130, cooldown: 1.4, color: '#3aa0ff', radius: 9  }
+  // ---------- unit stat sheet (thang điểm 0–10) ----------
+  // hpBase / atkBase: số máu / sát thương "đọc được" theo yêu cầu thiết kế.
+  // atkSpeedRating / speedRating: thang 0-10, quy đổi bên dưới.
+  //   - tốc đánh: 10/10 = 1 giây/đòn, 1/10 = 10 giây/đòn  → cooldown = 10 / rating
+  //   - tốc độ:   quy tuyến tính theo rating/10 * speedMax
+  const UNIT_DEFS_RAW = {
+    swordsman: { hpBase: 6, atkBase: 0.6, atkSpeedRating: 4,  speedRating: 4, range: 16,  radius: 11, color: '#e5484d' },
+    archer:    { hpBase: 3, atkBase: 1,   atkSpeedRating: 8,  speedRating: 3, range: 130, radius: 9,  color: '#3aa0ff' },
+    knight:    { hpBase: 4, atkBase: 0.7, atkSpeedRating: 10, speedRating: 7, range: 20,  radius: 13, color: '#4ee08a' }
   };
-  const COLOR_TO_TYPE = { red: 'swordsman', blue: 'archer' };
+  // hệ số quy đổi từ thang điểm sang số liệu thật dùng trong mô phỏng —
+  // chỉnh ở đây để cân bằng lại toàn bộ game mà không đụng vào công thức.
+  const STAT_SCALE = { hp: 20, atk: 20, speedMax: 45 };
+
+  const UNIT_DEFS = {};
+  for (const [type, raw] of Object.entries(UNIT_DEFS_RAW)) {
+    UNIT_DEFS[type] = {
+      ...raw,
+      hp: raw.hpBase * STAT_SCALE.hp,
+      atk: raw.atkBase * STAT_SCALE.atk,
+      cooldown: 10 / raw.atkSpeedRating,
+      speed: (raw.speedRating / 10) * STAT_SCALE.speedMax
+    };
+  }
+  const UNIT_TYPE_KEYS = Object.keys(UNIT_DEFS); // ['swordsman','archer','knight']
+
+  // đơn vị mới triệu hồi được +40% tất cả chỉ số chiến đấu (sát thương, tốc
+  // độ, tầm đánh, tốc đánh) trong 1.5 giây rồi trở lại bình thường.
+  const SPAWN_BUFF_MULT = 1.4;
+  const SPAWN_BUFF_MS = 1500;
+
+  // tỉ lệ loại lính được gán cho MỖI Ô của khối rơi (độc lập theo từng ô,
+  // nên một khối có thể chứa nhiều loại lính khác nhau cùng lúc).
+  const CELL_TYPE_WEIGHTS = { swordsman: 1/3, archer: 1/3, knight: 1/3 };
+
+  function weightedRandomType(weights){
+    const r = Math.random();
+    let acc = 0;
+    for (const type of UNIT_TYPE_KEYS) {
+      acc += weights[type] || 0;
+      if (r <= acc) return type;
+    }
+    return UNIT_TYPE_KEYS[UNIT_TYPE_KEYS.length - 1];
+  }
+  function randomCellType(){ return weightedRandomType(CELL_TYPE_WEIGHTS); }
+
+  // 3 độ khó "chơi với máy": khoảng cách giữa các lần máy triệu hồi quân,
+  // và tỉ lệ loại lính máy chọn (khó hơn = triệu hồi nhanh hơn & thiên về
+  // lính mạnh/nhanh hơn).
+  const BOT_DIFFICULTY = {
+    easy:   { minGap: 3.5, maxGap: 6.0, weights: { swordsman: 0.5,  archer: 0.3,  knight: 0.2  } },
+    medium: { minGap: 2.2, maxGap: 4.0, weights: { swordsman: 0.4,  archer: 0.35, knight: 0.25 } },
+    hard:   { minGap: 1.2, maxGap: 2.4, weights: { swordsman: 0.3,  archer: 0.35, knight: 0.35 } }
+  };
 
   const SHAPES = {
     I: [[0,1],[1,1],[2,1],[3,1]],
@@ -26,14 +78,20 @@ const Game = (() => {
     S: [[1,0],[2,0],[0,1],[1,1]],
     Z: [[0,0],[1,0],[1,1],[2,1]],
     J: [[0,0],[0,1],[1,1],[2,1]],
-    L: [[2,0],[0,1],[1,1],[2,1]]
+    L: [[2,0],[0,1],[1,1],[2,1]],
+    // các hình mới — thêm độ đa dạng cho khối rơi
+    DOT:    [[1,1]],
+    DOMINO: [[1,1],[2,1]],
+    TRIO:   [[1,1],[2,1],[3,1]],
+    CORNER: [[1,1],[2,1],[1,2]],
+    PLUS:   [[1,0],[0,1],[1,1],[2,1],[1,2]]
   };
   const SHAPE_KEYS = Object.keys(SHAPES);
 
   // ---------- state ----------
-  let grid = makeEmptyGrid();
-  let cur = null;          // current falling piece
-  let nextType = null, nextColor = null;
+  let grid = makeEmptyGrid();      // mỗi ô lưu tên loại lính ('swordsman'/'archer'/'knight') hoặc null
+  let cur = null;                  // current falling piece: { key, cells, types, x, y }
+  let nextType = null;             // { key, cells, types }
   let dropTimer = 0, dropInterval = 0.8;
   let rowsCleared = 0;
   let paused = false;
@@ -49,15 +107,15 @@ const Game = (() => {
 
   // simple "chơi với máy" bot: periodically spawns a random unit for side B
   let botEnabled = false;
-  let botTimer = 3;
-  const BOT_TYPES = Object.keys(UNIT_DEFS);
+  let botDifficulty = 'medium';
+  let botTimer = BOT_DIFFICULTY[botDifficulty].minGap;
 
   // battle sim (authoritative when role is solo/host)
   let sim = { baseA: BASE_MAX_HP, baseB: BASE_MAX_HP, units: [], nextId: 1, over: false, winner: null };
   let lastRemoteState = null; // used when role === 'client'
 
   const hooks = {
-    onLocalRowCleared: null,   // (color, rowsClearedTotal) => {}
+    onLocalRowCleared: null,   // (rowTypes: string[], rowsClearedTotal) => {}
     onGameOver: null           // (winnerSide) => {}
   };
 
@@ -74,15 +132,17 @@ const Game = (() => {
   // ---------- puzzle piece helpers ----------
   function randomPiece(){
     const key = SHAPE_KEYS[Math.floor(Math.random() * SHAPE_KEYS.length)];
-    const color = Math.random() < 0.5 ? 'red' : 'blue';
-    return { key, color, cells: SHAPES[key].map(c => c.slice()) };
+    const cells = SHAPES[key].map(c => c.slice());
+    const types = cells.map(() => randomCellType());
+    return { key, cells, types };
   }
 
   function spawnPiece(){
-    const type = nextType || randomPiece();
+    const piece = nextType || randomPiece();
     cur = {
-      key: type.key, color: type.color,
-      cells: type.cells.map(c => c.slice()),
+      key: piece.key,
+      cells: piece.cells.map(c => c.slice()),
+      types: piece.types.slice(),
       x: Math.floor(COLS / 2) - 2, y: 0
     };
     nextType = randomPiece();
@@ -103,7 +163,8 @@ const Game = (() => {
   }
 
   function rotate(p){
-    // rotate around piece-local center (2,2) for a 4x4 box, classic SRS-lite
+    // rotate around piece-local center (2,2) for a 4x4 box, classic SRS-lite.
+    // `types` stays index-aligned with `cells`, so it doesn't need to change.
     const rotated = p.cells.map(([cx, cy]) => [ (3 - cy), cx ]);
     return { ...p, cells: rotated };
   }
@@ -135,10 +196,10 @@ const Game = (() => {
   }
 
   function lockPiece(){
-    for (const [cx, cy] of cur.cells) {
+    cur.cells.forEach(([cx, cy], i) => {
       const gx = cur.x + cx, gy = cur.y + cy;
-      if (gy >= 0) grid[gy][gx] = cur.color;
-    }
+      if (gy >= 0) grid[gy][gx] = cur.types[i];
+    });
     clearFullRows();
     spawnPiece();
   }
@@ -146,17 +207,27 @@ const Game = (() => {
   function clearFullRows(){
     for (let r = ROWS - 1; r >= 0; r--) {
       if (grid[r].every(c => c)) {
-        let red = 0, blue = 0;
-        for (const c of grid[r]) c === 'red' ? red++ : blue++;
-        const dominant = red >= blue ? 'red' : 'blue';
+        const rowTypes = grid[r].slice(); // loại lính của từng ô trong hàng vừa nổ
         grid.splice(r, 1);
         grid.unshift(new Array(COLS).fill(null));
         rowsCleared++;
         document.getElementById('rowsCleared').textContent = rowsCleared;
-        if (hooks.onLocalRowCleared) hooks.onLocalRowCleared(dominant, rowsCleared);
+        triggerSummonEffect();
+        if (hooks.onLocalRowCleared) hooks.onLocalRowCleared(rowTypes, rowsCleared);
         r++; // re-check same index after shift
       }
     }
+  }
+
+  // visual-only pulse over the battlefield the instant a row clears —
+  // reads as "triệu hồi ra chiến trường" even before the units render in.
+  function triggerSummonEffect(){
+    const wrap = document.getElementById('battlefieldWrap');
+    if (!wrap) return;
+    const flash = document.createElement('div');
+    flash.className = 'summon-flash';
+    wrap.appendChild(flash);
+    flash.addEventListener('animationend', () => flash.remove());
   }
 
   // ---------- puzzle rendering ----------
@@ -177,8 +248,9 @@ const Game = (() => {
       for (let cIdx = 0; cIdx < COLS; cIdx++)
         if (grid[r][cIdx]) drawCell(puzzleCtx, cIdx, r, grid[r][cIdx], c);
     // current piece
-    if (cur) for (const [cx, cy] of cur.cells)
-      if (cur.y + cy >= 0) drawCell(puzzleCtx, cur.x + cx, cur.y + cy, cur.color, c);
+    if (cur) cur.cells.forEach(([cx, cy], i) => {
+      if (cur.y + cy >= 0) drawCell(puzzleCtx, cur.x + cx, cur.y + cy, cur.types[i], c);
+    });
 
     if (paused) {
       puzzleCtx.fillStyle = 'rgba(6,8,11,.75)';
@@ -190,35 +262,56 @@ const Game = (() => {
     }
   }
 
-  function drawCell(ctx, gx, gy, color, c){
+  function drawCell(ctx, gx, gy, type, c){
+    const def = UNIT_DEFS[type];
     const pad = 1.5;
-    ctx.fillStyle = color === 'red' ? '#e5484d' : '#3aa0ff';
+    ctx.fillStyle = def.color;
     ctx.fillRect(gx*c+pad, gy*c+pad, c-pad*2, c-pad*2);
-    ctx.strokeStyle = color === 'red' ? '#ff9a9d' : '#9ad2ff';
+    ctx.strokeStyle = def.color;
+    ctx.globalAlpha = 0.55;
     ctx.lineWidth = 1;
     ctx.strokeRect(gx*c+pad, gy*c+pad, c-pad*2, c-pad*2);
+    ctx.globalAlpha = 1;
   }
 
   function drawNextPreview(){
     nextCtx.clearRect(0, 0, nextCv.width, nextCv.height);
     const c = 18;
     const offX = (nextCv.width - 4*c) / 2, offY = (nextCv.height - 4*c) / 2;
-    for (const [cx, cy] of nextType.cells) {
-      nextCtx.fillStyle = nextType.color === 'red' ? '#e5484d' : '#3aa0ff';
+    nextType.cells.forEach(([cx, cy], i) => {
+      const def = UNIT_DEFS[nextType.types[i]];
+      nextCtx.fillStyle = def.color;
       nextCtx.fillRect(offX + cx*c + 1, offY + cy*c + 1, c-2, c-2);
-    }
+    });
   }
 
   // ---------- battle simulation (solo/host authoritative) ----------
   function spawnUnit(side, type){
-    if (gameOver) return;
+    if (gameOver || !UNIT_DEFS[type]) return;
     const def = UNIT_DEFS[type];
     sim.units.push({
       id: sim.nextId++, side, type,
       x: side === 'A' ? 0 : LANE_LEN,
       hp: def.hp, maxHp: def.hp,
-      cd: 0
+      cd: 0,
+      spawnTime: performance.now(),
+      buffed: true
     });
+  }
+
+  // stats "hiệu lực" tại thời điểm hiện tại — cộng thêm buff mới-triệu-hồi
+  // (sát thương / tốc độ / tầm đánh +40%, tốc đánh nhanh hơn tương ứng)
+  // nếu đơn vị vẫn còn trong 1.5 giây đầu đời.
+  function effectiveDef(u){
+    const def = UNIT_DEFS[u.type];
+    if (!u.buffed) return def;
+    return {
+      ...def,
+      atk: def.atk * SPAWN_BUFF_MULT,
+      speed: def.speed * SPAWN_BUFF_MULT,
+      range: def.range * SPAWN_BUFF_MULT,
+      cooldown: def.cooldown / SPAWN_BUFF_MULT
+    };
   }
 
   function tickBattle(dt){
@@ -227,9 +320,9 @@ const Game = (() => {
     if (botEnabled) {
       botTimer -= dt;
       if (botTimer <= 0) {
-        const type = BOT_TYPES[Math.floor(Math.random() * BOT_TYPES.length)];
-        spawnUnit('B', type);
-        botTimer = 2.2 + Math.random() * 2.2; // ~2.2–4.4s between bot summons
+        const cfg = BOT_DIFFICULTY[botDifficulty];
+        spawnUnit('B', weightedRandomType(cfg.weights));
+        botTimer = cfg.minGap + Math.random() * (cfg.maxGap - cfg.minGap);
       }
     }
 
@@ -237,7 +330,8 @@ const Game = (() => {
 
     for (const u of units) {
       if (u.hp <= 0) continue;
-      const def = UNIT_DEFS[u.type];
+      u.buffed = (performance.now() - u.spawnTime) < SPAWN_BUFF_MS;
+      const def = effectiveDef(u);
       const dir = u.side === 'A' ? 1 : -1;
 
       // find nearest living enemy unit ahead
@@ -290,7 +384,7 @@ const Game = (() => {
   function getSnapshot(){
     return {
       baseA: sim.baseA, baseB: sim.baseB,
-      units: sim.units.map(u => ({ side: u.side, type: u.type, x: u.x, hp: u.hp, maxHp: u.maxHp })),
+      units: sim.units.map(u => ({ side: u.side, type: u.type, x: u.x, hp: u.hp, maxHp: u.maxHp, buffed: u.buffed })),
       over: sim.over, winner: sim.winner
     };
   }
@@ -299,7 +393,7 @@ const Game = (() => {
   // and for the client's last-received broadcast, so no extra network state
   // is needed to know when a unit is "firing" for rendering purposes.
   function findEngagementTarget(state, u){
-    const def = UNIT_DEFS[u.type];
+    const def = effectiveDef(u);
     let target = null, bestDist = Infinity;
     for (const o of state.units) {
       if (o.side === u.side || o.hp <= 0) continue;
@@ -380,7 +474,7 @@ const Game = (() => {
   }
 
   function drawUnit(x, y, u, isMine, engageX){
-    const def = UNIT_DEFS[u.type];
+    const def = effectiveDef(u);
     const engaged = engageX !== null && engageX !== undefined;
     const localTargetX = engaged ? engageX - x : null;
     const dir = engaged ? (localTargetX >= 0 ? 1 : -1) : (u.side === 'A' ? 1 : -1);
@@ -432,6 +526,30 @@ const Game = (() => {
       fieldCtx.moveTo(def.radius + 2, -5.5);
       fieldCtx.lineTo(def.radius + 2, 5.5);
       fieldCtx.stroke();
+    } else if (u.type === 'knight') {
+      // lance
+      fieldCtx.strokeStyle = '#d9a63e';
+      fieldCtx.lineWidth = 3;
+      fieldCtx.beginPath();
+      fieldCtx.moveTo(def.radius - 2, 0);
+      fieldCtx.lineTo(def.radius + 16, 0);
+      fieldCtx.stroke();
+      fieldCtx.fillStyle = '#d9a63e';
+      fieldCtx.beginPath();
+      fieldCtx.moveTo(def.radius + 16, -3);
+      fieldCtx.lineTo(def.radius + 22, 0);
+      fieldCtx.lineTo(def.radius + 16, 3);
+      fieldCtx.closePath();
+      fieldCtx.fill();
+      // hind legs hint (cưỡi ngựa)
+      fieldCtx.strokeStyle = '#0a0e14';
+      fieldCtx.lineWidth = 2;
+      fieldCtx.beginPath();
+      fieldCtx.moveTo(-def.radius + 3, def.radius - 3);
+      fieldCtx.lineTo(-def.radius + 6, def.radius + 5);
+      fieldCtx.moveTo(-def.radius - 2, def.radius - 3);
+      fieldCtx.lineTo(-def.radius - 5, def.radius + 5);
+      fieldCtx.stroke();
     }
     fieldCtx.restore();
 
@@ -451,6 +569,18 @@ const Game = (() => {
       fieldCtx.beginPath();
       fieldCtx.moveTo(4, 0); fieldCtx.lineTo(0, -2.5); fieldCtx.lineTo(0, 2.5); fieldCtx.closePath();
       fieldCtx.fillStyle = '#e8d9a0'; fieldCtx.fill();
+      fieldCtx.restore();
+    }
+
+    // buff ring — pulsing gold halo while the +40% mới-triệu-hồi buff is active
+    if (u.buffed) {
+      fieldCtx.save();
+      fieldCtx.strokeStyle = 'rgba(217,166,62,0.9)';
+      fieldCtx.lineWidth = 2;
+      const pulse = def.radius + 4 + Math.sin(performance.now() / 80) * 2;
+      fieldCtx.beginPath();
+      fieldCtx.arc(0, 0, pulse, 0, Math.PI*2);
+      fieldCtx.stroke();
       fieldCtx.restore();
     }
 
@@ -514,6 +644,12 @@ const Game = (() => {
       paused = !paused;
       document.getElementById('btnPause').textContent = paused ? 'TIẾP TỤC' : 'TẠM DỪNG';
     });
+
+    // explicit rotate button — same as swipe-up/ArrowUp, useful on mobile
+    // where a deliberate tap is easier than a precise upward swipe.
+    document.getElementById('btnRotate').addEventListener('click', () => {
+      if (!paused && !gameOver) tryRotate();
+    });
   }
 
   // ---------- main loop ----------
@@ -553,7 +689,8 @@ const Game = (() => {
     grid = makeEmptyGrid();
     sim = { baseA: BASE_MAX_HP, baseB: BASE_MAX_HP, units: [], nextId: 1, over: false, winner: null };
     lastRemoteState = null;
-    rowsCleared = 0; gameOver = false; paused = false; botTimer = 3;
+    rowsCleared = 0; gameOver = false; paused = false;
+    botTimer = BOT_DIFFICULTY[botDifficulty].minGap;
     cur = null;
     document.getElementById('rowsCleared').textContent = 0;
     document.getElementById('gameOverBanner').classList.add('hidden');
@@ -566,12 +703,17 @@ const Game = (() => {
     hooks,
     setRole(r, side){ role = r; mySide = side; },
     getMySide(){ return mySide; },
-    setBotMode(enabled){ botEnabled = enabled; botTimer = 3; },
+    // difficulty: 'easy' | 'medium' | 'hard' (defaults to 'medium' / keeps
+    // the current one if an unknown value is passed)
+    setBotMode(enabled, difficulty){
+      botEnabled = enabled;
+      if (difficulty && BOT_DIFFICULTY[difficulty]) botDifficulty = difficulty;
+      botTimer = BOT_DIFFICULTY[botDifficulty].minGap;
+    },
     spawnUnit,
     onRemoteSpawn(side, type){ spawnUnit(side, type); },
     getSnapshot,
     applyRemoteState,
-    colorToType(color){ return COLOR_TO_TYPE[color]; },
     // Reset to a clean, idle board and STOP — used the moment a player enters
     // a host/join room, so nothing falls or fights while still waiting for
     // an opponent to actually connect.
