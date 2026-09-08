@@ -21,6 +21,24 @@
    playtesting, but swap in your own TURN credentials (Twilio,
    Metered, Cloudflare Calls, etc.) before any real launch, since
    the shared one can be rate-limited or go down without notice.
+
+   NOTE on camera/mic lifecycle:
+   Camera and mic are now NEVER requested just from connecting to
+   a room. Each device is only opened (getUserMedia) the instant
+   the player presses its button, and is genuinely stopped
+   (track.stop()) — not just muted — the instant they press it
+   again. This means:
+     - No permission prompt / camera light until the player asks.
+     - Toggling off actually releases the hardware.
+   Because the very first press can happen after the two players
+   are already connected, we can't always rely on the initial
+   call's SDP having a video/audio section ready to go. So a
+   media call is only placed the first time either side turns
+   something on, and any track added afterward is attached via
+   RTCPeerConnection.addTrack + a small hand-rolled renegotiation
+   (offer/answer exchanged over the existing reliable data
+   channel) — turning a track back off/on again after that reuses
+   the same sender via replaceTrack, which needs no renegotiation.
    =========================================================== */
 
 const Net = (() => {
@@ -56,12 +74,20 @@ const Net = (() => {
 
   let peer = null;
   let conn = null;          // PeerJS DataConnection
-  let mediaCall = null;
-  let localStream = null;
   let role = 'solo';        // 'solo' | 'host' | 'client'
   let broadcastTimer = null;
   let currentRoomCode = null; // room code the client is connecting to (used to place the media call once connected)
   let slowConnTimer = null;
+
+  // ---------- media state ----------
+  // micStream / camStream: each either null (device off, hardware fully
+  // released) or a live MediaStream holding exactly that one track.
+  let micStream = null;
+  let camStream = null;
+  let mediaCall = null;          // PeerJS MediaConnection, created lazily on first toggle
+  let audioSender = null;        // RTCRtpSender once a mic track has been added at least once
+  let videoSender = null;        // RTCRtpSender once a cam track has been added at least once
+  let remotePeerId = null;       // learned from the client's 'hello' — lets the host place a call too
 
   const els = {};
 
@@ -107,11 +133,6 @@ const Net = (() => {
   }
 
   // ---------- slow-connection watchdog ----------
-  // Starts a timer when we begin actively trying to reach the peer
-  // (data connection requested/received). Cleared as soon as the data
-  // connection opens. If it fires, we're very likely stuck because a
-  // direct P2P path failed and no TURN relay path has been found either
-  // — most common when both TURN and a strict NAT/firewall collide.
   function armSlowConnWarning(){
     clearSlowConnWarning();
     slowConnTimer = setTimeout(() => {
@@ -126,69 +147,176 @@ const Net = (() => {
     slowConnTimer = null;
   }
 
-  // ---------- media (camera / mic) ----------
-  // Tries video+audio first, then falls back to whichever device is
-  // actually available so one denied/missing device doesn't kill both.
-  async function ensureLocalMedia(){
-    if (localStream) return localStream;
-    const attempts = [
-      { video: true, audio: true },
-      { video: false, audio: true },
-      { video: true, audio: false }
-    ];
-    for (const constraints of attempts) {
-      try {
-        localStream = await navigator.mediaDevices.getUserMedia(constraints);
-        break;
-      } catch (err) {
-        console.warn('getUserMedia thất bại với', constraints, err.name);
-      }
-    }
-    if (localStream) {
-      els.localVideo.srcObject = localStream;
-    }
-    syncMediaButtons();
-    return localStream;
-  }
-
+  // ---------- media: buttons ----------
   function syncMediaButtons(){
-    const audioTrack = localStream && localStream.getAudioTracks()[0];
-    const videoTrack = localStream && localStream.getVideoTracks()[0];
+    els.btnMic.disabled = false;
+    els.btnMic.dataset.on = micStream ? '1' : '0';
+    els.btnMic.textContent = 'MIC: ' + (micStream ? 'BẬT' : 'TẮT');
 
-    if (audioTrack) {
-      els.btnMic.disabled = false;
-      els.btnMic.dataset.on = audioTrack.enabled ? '1' : '0';
-      els.btnMic.textContent = 'MIC: ' + (audioTrack.enabled ? 'BẬT' : 'TẮT');
-    } else {
-      els.btnMic.disabled = true;
-      els.btnMic.dataset.on = '0';
-      els.btnMic.textContent = 'MIC: KHÔNG CÓ';
-    }
-
-    if (videoTrack) {
-      els.btnCam.disabled = false;
-      els.btnCam.dataset.on = videoTrack.enabled ? '1' : '0';
-      els.btnCam.textContent = 'CAM: ' + (videoTrack.enabled ? 'BẬT' : 'TẮT');
-    } else {
-      els.btnCam.disabled = true;
-      els.btnCam.dataset.on = '0';
-      els.btnCam.textContent = 'CAM: KHÔNG CÓ';
-    }
-  }
-
-  async function toggleTrack(kind){
-    if (!localStream) await ensureLocalMedia();
-    const track = kind === 'audio'
-      ? localStream && localStream.getAudioTracks()[0]
-      : localStream && localStream.getVideoTracks()[0];
-    if (!track) return;
-    track.enabled = !track.enabled;
-    syncMediaButtons();
+    els.btnCam.disabled = false;
+    els.btnCam.dataset.on = camStream ? '1' : '0';
+    els.btnCam.textContent = 'CAM: ' + (camStream ? 'BẬT' : 'TẮT');
   }
 
   function wireMediaButtons(){
-    els.btnMic.addEventListener('click', () => toggleTrack('audio'));
-    els.btnCam.addEventListener('click', () => toggleTrack('video'));
+    els.btnMic.addEventListener('click', toggleMic);
+    els.btnCam.addEventListener('click', toggleCam);
+  }
+
+  // combined MediaStream of whatever is currently ON — used whenever we
+  // need to hand a stream to peer.call()/call.answer()/addTrack().
+  function getActiveStream(){
+    const s = new MediaStream();
+    if (micStream) micStream.getAudioTracks().forEach(t => s.addTrack(t));
+    if (camStream) camStream.getVideoTracks().forEach(t => s.addTrack(t));
+    return s;
+  }
+
+  async function toggleMic(){
+    if (micStream) {
+      // TẮT THẬT SỰ: dừng hẳn track phần cứng, không chỉ ẩn/mute
+      micStream.getTracks().forEach(t => t.stop());
+      micStream = null;
+      if (audioSender) { try { await audioSender.replaceTrack(null); } catch (e) { console.warn(e); } }
+      syncMediaButtons();
+      return;
+    }
+    try {
+      micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (err) {
+      console.warn('Không thể bật mic:', err.name);
+      return;
+    }
+    syncMediaButtons();
+    await onLocalTrackChanged();
+  }
+
+  async function toggleCam(){
+    if (camStream) {
+      // TẮT THẬT SỰ: dừng hẳn track phần cứng (đèn camera tắt), không chỉ
+      // ẩn khung hình đi trong khi camera vẫn chạy ngầm.
+      camStream.getTracks().forEach(t => t.stop());
+      camStream = null;
+      els.localVideo.srcObject = null;
+      if (videoSender) { try { await videoSender.replaceTrack(null); } catch (e) { console.warn(e); } }
+      syncMediaButtons();
+      return;
+    }
+    try {
+      camStream = await navigator.mediaDevices.getUserMedia({ video: true });
+    } catch (err) {
+      console.warn('Không thể bật camera:', err.name);
+      return;
+    }
+    els.localVideo.srcObject = camStream;
+    syncMediaButtons();
+    await onLocalTrackChanged();
+  }
+
+  // Called right after a track turns on. If no media call exists yet,
+  // establish one now (lazily — this is the first time there's anything
+  // to send). If a call already exists, just attach/replace the track on it.
+  async function onLocalTrackChanged(){
+    if (!conn || !conn.open) return; // not connected to an opponent yet — just keep local preview updated
+    if (!mediaCall) {
+      const stream = getActiveStream();
+      if (stream.getTracks().length === 0) return;
+      if (role === 'client') {
+        wireMediaCall(peer.call(PEER_PREFIX + currentRoomCode, stream));
+      } else if (remotePeerId) {
+        wireMediaCall(peer.call(remotePeerId, stream));
+      } else {
+        // Host turned something on first but doesn't know the client's
+        // peer id yet (it only shows up in the 'hello' message) — ask the
+        // client to be the one placing the call instead.
+        send({ type: 'want-call' });
+      }
+    } else {
+      await syncSendersToCurrentTracks();
+    }
+  }
+
+  function wireMediaCall(call){
+    mediaCall = call;
+    call.on('stream', (remoteStream) => { els.remoteVideo.srcObject = remoteStream; });
+    call.on('close', () => { mediaCall = null; audioSender = null; videoSender = null; });
+    call.on('error', (e) => console.warn('Media call error:', e));
+    captureExistingSenders();
+  }
+
+  // If the call was just created with tracks already in its initial stream
+  // (e.g. answering with a mic that was turned on before the call existed),
+  // those senders exist from the start — grab references so later toggles
+  // can use replaceTrack instead of addTrack.
+  function captureExistingSenders(){
+    if (!mediaCall || !mediaCall.peerConnection) return;
+    const senders = mediaCall.peerConnection.getSenders();
+    audioSender = senders.find(s => s.track && s.track.kind === 'audio') || audioSender;
+    videoSender = senders.find(s => s.track && s.track.kind === 'video') || videoSender;
+  }
+
+  // Adds/replaces/mutes senders on the existing media call to match
+  // whatever mic/cam is currently on. Adding a brand-new sender (first time
+  // that device turns on after the call already exists) requires a manual
+  // renegotiation over the data channel; swapping an existing sender's
+  // track (turning something back on/off afterward) does not.
+  async function syncSendersToCurrentTracks(){
+    if (!mediaCall || !mediaCall.peerConnection) return;
+    const pc = mediaCall.peerConnection;
+    let needsRenegotiation = false;
+
+    const audioTrack = micStream ? micStream.getAudioTracks()[0] : null;
+    if (audioTrack) {
+      if (audioSender) { try { await audioSender.replaceTrack(audioTrack); } catch (e) { console.warn(e); } }
+      else { audioSender = pc.addTrack(audioTrack, getActiveStream()); needsRenegotiation = true; }
+    } else if (audioSender) {
+      try { await audioSender.replaceTrack(null); } catch (e) { console.warn(e); }
+    }
+
+    const videoTrack = camStream ? camStream.getVideoTracks()[0] : null;
+    if (videoTrack) {
+      if (videoSender) { try { await videoSender.replaceTrack(videoTrack); } catch (e) { console.warn(e); } }
+      else { videoSender = pc.addTrack(videoTrack, getActiveStream()); needsRenegotiation = true; }
+    } else if (videoSender) {
+      try { await videoSender.replaceTrack(null); } catch (e) { console.warn(e); }
+    }
+
+    if (needsRenegotiation) await sendRenegotiationOffer();
+  }
+
+  async function sendRenegotiationOffer(){
+    if (!mediaCall || !mediaCall.peerConnection || !conn || !conn.open) return;
+    try {
+      const pc = mediaCall.peerConnection;
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      send({ type: 'renegotiate-offer', sdp: pc.localDescription });
+    } catch (e) {
+      console.warn('Renegotiate (offer) lỗi:', e);
+    }
+  }
+
+  async function handleRenegotiateOffer(sdp){
+    if (!mediaCall || !mediaCall.peerConnection) return;
+    try {
+      const pc = mediaCall.peerConnection;
+      await pc.setRemoteDescription(sdp);
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      send({ type: 'renegotiate-answer', sdp: pc.localDescription });
+      captureExistingSenders();
+    } catch (e) {
+      console.warn('Renegotiate (answer) lỗi:', e);
+    }
+  }
+
+  async function handleRenegotiateAnswer(sdp){
+    if (!mediaCall || !mediaCall.peerConnection) return;
+    try {
+      await mediaCall.peerConnection.setRemoteDescription(sdp);
+    } catch (e) {
+      console.warn('Renegotiate (áp dụng answer) lỗi:', e);
+    }
   }
 
   // ---------- data channel protocol ----------
@@ -203,6 +331,24 @@ const Net = (() => {
         break;
       case 'chat':
         spawnDanmaku(msg.text, 'theirs');
+        break;
+      case 'hello':
+        // sent once by the client right after connecting, so the host can
+        // place a media call later too (host has no other way to learn
+        // the client's peer id, since the client's id is random).
+        remotePeerId = msg.peerId;
+        break;
+      case 'want-call':
+        // the host turned mic/cam on first and doesn't have a call yet —
+        // only the client can dial the host's fixed room-code id, so the
+        // client places the call on the host's behalf.
+        if (!mediaCall) wireMediaCall(peer.call(PEER_PREFIX + currentRoomCode, getActiveStream()));
+        break;
+      case 'renegotiate-offer':
+        handleRenegotiateOffer(msg.sdp);
+        break;
+      case 'renegotiate-answer':
+        handleRenegotiateAnswer(msg.sdp);
         break;
     }
   }
@@ -230,20 +376,14 @@ const Net = (() => {
       };
     }
 
-    conn.on('open', async () => {
+    conn.on('open', () => {
       clearSlowConnWarning();
       setConnState('online');
       els.roomLabel.textContent = 'ĐÃ KẾT NỐI';
+      syncMediaButtons(); // both OFF by default — camera/mic are never auto-started
 
-      // camera/mic are only requested now that a real opponent is connected —
-      // never just from entering the home screen or opening/joining a room
-      await ensureLocalMedia();
-
-      if (role === 'host') {
-        startBroadcasting();
-      } else if (role === 'client' && localStream && localStream.getTracks().length) {
-        mediaCall = peer.call(PEER_PREFIX + currentRoomCode, localStream);
-        mediaCall.on('stream', (remoteStream) => { els.remoteVideo.srcObject = remoteStream; });
+      if (role === 'client') {
+        send({ type: 'hello', peerId: peer.id });
       }
 
       // the puzzle grid / battle sim only actually starts running once the
@@ -307,9 +447,10 @@ const Net = (() => {
     });
     peer.on('connection', (c) => attachConnHandlers(c));
     peer.on('call', (call) => {
-      call.answer(localStream || undefined);
-      mediaCall = call;
-      call.on('stream', (remoteStream) => { els.remoteVideo.srcObject = remoteStream; });
+      // trả lời bằng bất cứ track nào đang BẬT tại thời điểm này (có thể
+      // rỗng nếu chưa ai bật mic/cam) — không bao giờ tự xin quyền camera/mic
+      call.answer(getActiveStream());
+      wireMediaCall(call);
     });
     peer.on('error', (e) => {
       console.warn('Peer error:', e);
@@ -350,12 +491,10 @@ const Net = (() => {
     peer.on('open', () => {
       const c = peer.connect(PEER_PREFIX + code, { reliable: true });
       attachConnHandlers(c);
-      // the media call itself is placed once the data connection opens
-      // and local media has been acquired (see attachConnHandlers)
     });
     peer.on('call', (call) => {
-      call.answer(localStream || undefined);
-      call.on('stream', (remoteStream) => { els.remoteVideo.srcObject = remoteStream; });
+      call.answer(getActiveStream());
+      wireMediaCall(call);
     });
     peer.on('error', (e) => {
       console.warn('Peer error:', e);
@@ -376,6 +515,7 @@ const Net = (() => {
     setConnState('offline');
     const label = BOT_DIFFICULTY_LABEL[difficulty] || 'THƯỜNG';
     els.roomLabel.textContent = 'CHẾ ĐỘ CHƠI VỚI MÁY — ' + label;
+    syncMediaButtons();
     // camera/mic are optional here (there's no remote peer to send them to)
     // so they're only requested if the player presses CAM/MIC themselves.
   }
@@ -383,9 +523,14 @@ const Net = (() => {
   function teardown(){
     clearSlowConnWarning();
     stopBroadcasting();
-    if (localStream) localStream.getTracks().forEach(t => t.stop());
+    if (micStream) micStream.getTracks().forEach(t => t.stop());
+    if (camStream) camStream.getTracks().forEach(t => t.stop());
+    micStream = null; camStream = null;
+    audioSender = null; videoSender = null;
+    remotePeerId = null;
     if (conn) { try { conn.close(); } catch (e) {} }
     if (mediaCall) { try { mediaCall.close(); } catch (e) {} }
+    mediaCall = null;
     if (peer) { try { peer.destroy(); } catch (e) {} }
   }
 
@@ -474,6 +619,7 @@ const Net = (() => {
 
   function init(){
     cacheEls();
+    syncMediaButtons(); // TẮT/TẮT ngay từ đầu — chưa nối ai thì chưa xin quyền gì cả
     wireMediaButtons();
     wireChatForm();
     wireGameHooks();
