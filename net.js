@@ -8,14 +8,51 @@
 
    Also wires the home-menu screen (create / join / bot difficulty)
    and handles camera+mic acquisition with graceful fallbacks.
+
+   NOTE on cross-network play (wifi <-> mobile data):
+   STUN alone (stun.l.google.com) can only establish a *direct*
+   P2P path. If either side sits behind a symmetric/strict NAT —
+   very common on carrier-grade NAT used by mobile data networks —
+   a direct path is impossible and the connection silently hangs.
+   We add TURN servers (relay fallback) so the browsers can still
+   talk to each other by relaying traffic through a third party
+   when a direct hole-punch fails. The public openrelay.metered.ca
+   credentials below are a free/shared test relay — fine for
+   playtesting, but swap in your own TURN credentials (Twilio,
+   Metered, Cloudflare Calls, etc.) before any real launch, since
+   the shared one can be rate-limited or go down without notice.
    =========================================================== */
 
 const Net = (() => {
 
   const PEER_PREFIX = 'puzzlebattalion-';
-  const ICE_CONFIG = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+  const ICE_CONFIG = {
+    iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' },
+      // TURN relay fallback — required for many wifi<->mobile-data pairings
+      {
+        urls: 'turn:openrelay.metered.ca:80',
+        username: 'openrelayproject',
+        credential: 'openrelayproject'
+      },
+      {
+        urls: 'turn:openrelay.metered.ca:443',
+        username: 'openrelayproject',
+        credential: 'openrelayproject'
+      },
+      {
+        urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+        username: 'openrelayproject',
+        credential: 'openrelayproject'
+      }
+    ]
+  };
   const STATE_HZ = 12; // host -> client broadcast rate
   const BOT_DIFFICULTY_LABEL = { easy: 'DỄ', medium: 'THƯỜNG', hard: 'KHÓ' };
+  // if we haven't reached "online" this long after opening the data
+  // connection attempt, the most likely cause is strict NAT on one side
+  // and no usable relay path yet — surface that instead of looking frozen
+  const SLOW_CONN_WARN_MS = 9000;
 
   let peer = null;
   let conn = null;          // PeerJS DataConnection
@@ -24,6 +61,7 @@ const Net = (() => {
   let role = 'solo';        // 'solo' | 'host' | 'client'
   let broadcastTimer = null;
   let currentRoomCode = null; // room code the client is connecting to (used to place the media call once connected)
+  let slowConnTimer = null;
 
   const els = {};
 
@@ -66,6 +104,26 @@ const Net = (() => {
   function showGameScreen(){
     els.homeScreen.classList.add('hidden');
     els.app.classList.remove('hidden');
+  }
+
+  // ---------- slow-connection watchdog ----------
+  // Starts a timer when we begin actively trying to reach the peer
+  // (data connection requested/received). Cleared as soon as the data
+  // connection opens. If it fires, we're very likely stuck because a
+  // direct P2P path failed and no TURN relay path has been found either
+  // — most common when both TURN and a strict NAT/firewall collide.
+  function armSlowConnWarning(){
+    clearSlowConnWarning();
+    slowConnTimer = setTimeout(() => {
+      if (els.roomLabel) {
+        els.roomLabel.textContent =
+          'Kết nối đang chậm — có thể do mạng của một bên (đặc biệt là 4G/5G) chặn kết nối trực tiếp. Đang thử qua máy chủ trung gian, vui lòng đợi thêm hoặc thử lại bằng wifi khác.';
+      }
+    }, SLOW_CONN_WARN_MS);
+  }
+  function clearSlowConnWarning(){
+    if (slowConnTimer) clearTimeout(slowConnTimer);
+    slowConnTimer = null;
   }
 
   // ---------- media (camera / mic) ----------
@@ -155,7 +213,25 @@ const Net = (() => {
 
   function attachConnHandlers(c){
     conn = c;
+    armSlowConnWarning();
+
+    // Extra diagnostics: watch the underlying RTCPeerConnection's ICE
+    // state so we can tell "still negotiating" apart from "actually
+    // stuck" — useful specifically for the wifi<->mobile-data case where
+    // ICE has to fall through to a relay (TURN) candidate.
+    if (c.peerConnection) {
+      c.peerConnection.oniceconnectionstatechange = () => {
+        const state = c.peerConnection.iceConnectionState;
+        console.log('ICE state:', state);
+        if (state === 'failed' && els.roomLabel) {
+          els.roomLabel.textContent =
+            'Không thể kết nối trực tiếp lẫn qua máy chủ trung gian. Hãy kiểm tra mạng (thử đổi sang wifi) rồi thử lại.';
+        }
+      };
+    }
+
     conn.on('open', async () => {
+      clearSlowConnWarning();
       setConnState('online');
       els.roomLabel.textContent = 'ĐÃ KẾT NỐI';
 
@@ -177,11 +253,15 @@ const Net = (() => {
     });
     conn.on('data', onData);
     conn.on('close', () => {
+      clearSlowConnWarning();
       setConnState('offline');
       els.roomLabel.textContent = 'MẤT KẾT NỐI';
       stopBroadcasting();
     });
-    conn.on('error', (e) => console.warn('Data connection error:', e));
+    conn.on('error', (e) => {
+      console.warn('Data connection error:', e);
+      clearSlowConnWarning();
+    });
   }
 
   function startBroadcasting(){
@@ -223,7 +303,7 @@ const Net = (() => {
     }
 
     peer.on('open', () => {
-      els.roomLabel.textContent = 'MÃ PHÒNG: ' + code + ' — đang chờ đối thủ...';
+      els.roomLabel.textContent = 'MÃ PHÒNG: ' + code + ' — đang chờ đối thủ (chơi được xuyên mạng khác nhau)...';
     });
     peer.on('connection', (c) => attachConnHandlers(c));
     peer.on('call', (call) => {
@@ -233,6 +313,7 @@ const Net = (() => {
     });
     peer.on('error', (e) => {
       console.warn('Peer error:', e);
+      clearSlowConnWarning();
       setConnState('offline');
       els.roomLabel.textContent = e.type === 'unavailable-id'
         ? 'Mã phòng đang được dùng, hãy về trang chủ và tạo lại.'
@@ -278,6 +359,7 @@ const Net = (() => {
     });
     peer.on('error', (e) => {
       console.warn('Peer error:', e);
+      clearSlowConnWarning();
       setConnState('offline');
       els.roomLabel.textContent = e.type === 'peer-unavailable'
         ? 'Không tìm thấy phòng với mã này.'
@@ -299,6 +381,7 @@ const Net = (() => {
   }
 
   function teardown(){
+    clearSlowConnWarning();
     stopBroadcasting();
     if (localStream) localStream.getTracks().forEach(t => t.stop());
     if (conn) { try { conn.close(); } catch (e) {} }
