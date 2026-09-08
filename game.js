@@ -9,7 +9,10 @@
 const Game = (() => {
 
   // ---------- constants ----------
-  const COLS = 8, ROWS = 10;
+  // Giữ đúng tỉ lệ 4:5 như cũ (8:10) để ô luôn vuông và khung lưới không
+  // đổi hình dạng trên giao diện — chỉ tăng số ô để mỗi ô nhỏ lại và xếp
+  // được nhiều khối hơn trên cùng một khung.
+  const COLS = 12, ROWS = 15;
   // battlefield "width": only affects how long a unit takes to walk from
   // base to base (toScreenX below normalizes by LANE_LEN, so the UI never
   // gets visually wider/longer — only travel time changes).
