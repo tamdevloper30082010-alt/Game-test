@@ -3,11 +3,11 @@
    Serverless P2P via PeerJS public cloud (signaling only).
    Room code = 3-4 digit number used as the Peer ID suffix.
    Host runs the authoritative battle sim (from game.js) and
-   broadcasts state; the client sends puzzle spawn events and
+   broadcasts state; the client sends row-clear spawn events and
    renders whatever the host broadcasts. See plan section III.
 
-   Also wires the home-menu screen (create / join / vs bot) and
-   handles camera+mic acquisition with graceful fallbacks.
+   Also wires the home-menu screen (create / join / bot difficulty)
+   and handles camera+mic acquisition with graceful fallbacks.
    =========================================================== */
 
 const Net = (() => {
@@ -15,6 +15,7 @@ const Net = (() => {
   const PEER_PREFIX = 'puzzlebattalion-';
   const ICE_CONFIG = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
   const STATE_HZ = 12; // host -> client broadcast rate
+  const BOT_DIFFICULTY_LABEL = { easy: 'DỄ', medium: 'THƯỜNG', hard: 'KHÓ' };
 
   let peer = null;
   let conn = null;          // PeerJS DataConnection
@@ -35,7 +36,8 @@ const Net = (() => {
     els.joinPanel    = document.getElementById('joinPanel');
     els.homeRoomInput = document.getElementById('homeRoomInput');
     els.menuJoinConfirm = document.getElementById('menuJoinConfirm');
-    els.menuBot      = document.getElementById('menuBot');
+    els.menuBotToggle = document.getElementById('menuBotToggle');
+    els.botPanel     = document.getElementById('botPanel');
 
     els.btnHome   = document.getElementById('btnHome');
     els.connDot   = document.getElementById('connState');
@@ -134,9 +136,9 @@ const Net = (() => {
   // ---------- data channel protocol ----------
   function onData(msg){
     switch (msg.type) {
-      case 'spawn':
+      case 'spawnRow':
         // only the host acts on spawn requests, coming from the client (side B)
-        if (role === 'host') Game.onRemoteSpawn(msg.side, msg.unitType);
+        if (role === 'host') msg.unitTypes.forEach(t => Game.onRemoteSpawn(msg.side, t));
         break;
       case 'state':
         if (role === 'client') Game.applyRemoteState(msg.state);
@@ -283,14 +285,15 @@ const Net = (() => {
     });
   }
 
-  function startBotGame(){
+  function startBotGame(difficulty){
     role = 'solo';
     Game.setRole('solo', 'A');
-    Game.setBotMode(true);
+    Game.setBotMode(true, difficulty);
     showGameScreen();
     Game.start(); // no opponent to wait for — the match begins right away
     setConnState('offline');
-    els.roomLabel.textContent = 'CHẾ ĐỘ CHƠI VỚI MÁY';
+    const label = BOT_DIFFICULTY_LABEL[difficulty] || 'THƯỜNG';
+    els.roomLabel.textContent = 'CHẾ ĐỘ CHƠI VỚI MÁY — ' + label;
     // camera/mic are optional here (there's no remote peer to send them to)
     // so they're only requested if the player presses CAM/MIC themselves.
   }
@@ -337,14 +340,15 @@ const Net = (() => {
 
   // ---------- puzzle -> battle bridge ----------
   function wireGameHooks(){
-    Game.hooks.onLocalRowCleared = (color) => {
-      const unitType = Game.colorToType(color);
+    // rowTypes: mảng loại lính (mỗi ô một loại) của hàng vừa nổ — một hàng
+    // có thể triệu hồi nhiều loại lính khác nhau cùng lúc.
+    Game.hooks.onLocalRowCleared = (rowTypes) => {
       const side = Game.getMySide();
       if (role === 'client') {
-        send({ type: 'spawn', side, unitType });
+        send({ type: 'spawnRow', side, unitTypes: rowTypes });
       } else {
         // solo sandbox, vs-bot, or host: spawn directly into the authoritative sim
-        Game.spawnUnit(side, unitType);
+        rowTypes.forEach(t => Game.spawnUnit(side, t));
       }
     };
     Game.hooks.onGameOver = () => { stopBroadcasting(); };
@@ -355,6 +359,7 @@ const Net = (() => {
     els.menuHost.addEventListener('click', () => { setHomeStatus(''); hostGame(); });
 
     els.menuJoinToggle.addEventListener('click', () => {
+      els.botPanel.classList.add('hidden');
       els.joinPanel.classList.toggle('hidden');
       if (!els.joinPanel.classList.contains('hidden')) els.homeRoomInput.focus();
     });
@@ -367,7 +372,16 @@ const Net = (() => {
       if (e.key === 'Enter') els.menuJoinConfirm.click();
     });
 
-    els.menuBot.addEventListener('click', () => { setHomeStatus(''); startBotGame(); });
+    els.menuBotToggle.addEventListener('click', () => {
+      els.joinPanel.classList.add('hidden');
+      els.botPanel.classList.toggle('hidden');
+    });
+    els.botPanel.querySelectorAll('.bot-diff').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        setHomeStatus('');
+        startBotGame(btn.dataset.diff);
+      });
+    });
 
     els.btnHome.addEventListener('click', () => {
       teardown();
