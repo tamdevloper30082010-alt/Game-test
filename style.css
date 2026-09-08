@@ -1,6 +1,6 @@
 /* ===========================================================
    PUZZLE BATTALION — tactical HUD theme
-   Palette: charcoal base, gold-amber accent, red/blue faction colors
+   Palette: charcoal base, gold-amber accent, red/blue/green faction colors
    Type: Chakra Petch (labels/headers) + IBM Plex Mono (numbers/HUD)
    =========================================================== */
 
@@ -16,6 +16,8 @@
   --red-dim:       #6a2426;
   --blue:          #3aa0ff;
   --blue-dim:      #1f4568;
+  --green:         #4ee08a;
+  --green-dim:     #1e5237;
   --danger:        #ff5b5b;
 }
 
@@ -69,13 +71,17 @@ img, canvas, video{ max-width:100%; display:block; }
   padding:14px 12px; font-size:15px; letter-spacing:.04em;
   text-align:center;
 }
-.menu-join{ display:flex; flex-direction:column; gap:8px; }
+.menu-join, .menu-bot{ display:flex; flex-direction:column; gap:8px; }
 .join-panel{ display:flex; gap:8px; }
 .join-panel input{
   flex:1 1 auto; min-width:0;
   background:#000; border:1px solid var(--line); color: var(--gold);
   font-family:'IBM Plex Mono',monospace; font-size:16px; letter-spacing:.15em;
   text-align:center; padding:10px 6px;
+}
+.bot-panel{ gap:6px; }
+.bot-panel .btn-tac{
+  flex:1 1 0; text-align:center; padding:10px 4px; font-size:12px;
 }
 .home-status{
   min-height:16px; text-align:center; font-size:11px; color: var(--text-dim);
@@ -194,6 +200,19 @@ img, canvas, video{ max-width:100%; display:block; }
 }
 #gameOverBanner span{ font-size:12px; color: var(--text-dim); font-family:'IBM Plex Mono',monospace; }
 
+/* summon-effect flash: fired once per row clear, purely a visual pulse
+   over the battlefield so a row clear reads as "triệu hồi ra chiến trường" */
+.summon-flash{
+  position:absolute; inset:0; pointer-events:none;
+  background: radial-gradient(circle at center, rgba(217,166,62,.35), rgba(217,166,62,0) 70%);
+  animation: summonPulse .5s ease-out forwards;
+}
+@keyframes summonPulse{
+  0%{ opacity:0; }
+  30%{ opacity:1; }
+  100%{ opacity:0; }
+}
+
 /* ---------- MEDIA DOCK ---------- */
 #mediaDock{
   display:flex; align-items:center; gap:6px; flex-wrap:wrap;
@@ -240,6 +259,7 @@ img, canvas, video{ max-width:100%; display:block; }
   display:flex; flex-direction:column; gap:6px; width:92px; flex:0 0 auto;
   max-height:100%; overflow:auto;
 }
+.puzzle-side-panel .btn-tac{ text-align:center; }
 .panel-block{
   background: var(--panel);
   border:1px solid var(--line);
@@ -256,6 +276,7 @@ img, canvas, video{ max-width:100%; display:block; }
 .dot{ width:7px; height:7px; border-radius:50%; display:inline-block; flex:0 0 auto; }
 .dot.red{ background: var(--red); }
 .dot.blue{ background: var(--blue); }
+.dot.knight{ background: var(--green); }
 
 /* ===========================================================
    RESPONSIVE — phones: stack the puzzle panel below the grid,
@@ -288,6 +309,7 @@ img, canvas, video{ max-width:100%; display:block; }
   }
   .puzzle-side-panel .panel-block{ flex:1 1 80px; }
   .puzzle-side-panel .legend{ flex-basis:100%; }
+  .puzzle-side-panel .btn-tac{ flex:1 1 70px; }
   .panel-value{ font-size:15px; }
   #nextPiece{ width:44px; height:44px; }
 
