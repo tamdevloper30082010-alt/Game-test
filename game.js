@@ -11,7 +11,7 @@ const Game = (() => {
   // ---------- constants ----------
   const COLS = 8, ROWS = 10;
   const LANE_LEN = 1000;          // logical battlefield width
-  const BASE_MAX_HP = 1000;
+  const BASE_MAX_HP = 3000;
 
   const UNIT_DEFS = {
     swordsman: { hp: 100, atk: 15, speed: 46, range: 16,  cooldown: 0.8, color: '#e5484d', radius: 11 },
@@ -38,6 +38,11 @@ const Game = (() => {
   let rowsCleared = 0;
   let paused = false;
   let gameOver = false;
+  let started = false;     // becomes true only when the actual match begins
+                            // (immediately for solo/bot, or once the opponent
+                            // connects for host/client) — prevents blocks from
+                            // silently falling/locking while still on the home
+                            // screen or waiting for a rival to join
 
   let role = 'solo';       // 'solo' | 'host' | 'client'
   let mySide = 'A';        // 'A' (left) or 'B' (right)
@@ -258,6 +263,9 @@ const Game = (() => {
         u.cd -= dt;
         if (u.cd <= 0) {
           if (u.side === 'A') sim.baseB -= def.atk; else sim.baseA -= def.atk;
+          // recoil: hitting the base costs the unit the same amount of HP,
+          // so players can't just pile units on the base for free
+          u.hp -= def.atk;
           u.cd = def.cooldown;
         }
         continue;
@@ -285,6 +293,25 @@ const Game = (() => {
       units: sim.units.map(u => ({ side: u.side, type: u.type, x: u.x, hp: u.hp, maxHp: u.maxHp })),
       over: sim.over, winner: sim.winner
     };
+  }
+
+  // pure function of a snapshot — works identically for the host's own sim
+  // and for the client's last-received broadcast, so no extra network state
+  // is needed to know when a unit is "firing" for rendering purposes.
+  function findEngagementTarget(state, u){
+    const def = UNIT_DEFS[u.type];
+    let target = null, bestDist = Infinity;
+    for (const o of state.units) {
+      if (o.side === u.side || o.hp <= 0) continue;
+      const ahead = u.side === 'A' ? (o.x >= u.x) : (o.x <= u.x);
+      if (!ahead) continue;
+      const d = Math.abs(o.x - u.x);
+      if (d < bestDist) { bestDist = d; target = o; }
+    }
+    if (target && bestDist <= def.range) return target.x;
+    const baseX = u.side === 'A' ? LANE_LEN : 0;
+    if (Math.abs(baseX - u.x) <= def.range) return baseX;
+    return null;
   }
 
   function applyRemoteState(state){
@@ -327,7 +354,9 @@ const Game = (() => {
     for (const u of state.units) {
       const isMine = (flip ? u.side === 'B' : u.side === 'A');
       const x = toScreenX(u.x);
-      drawUnit(x, midY, u, isMine);
+      const engageLogicalX = findEngagementTarget(state, u);
+      const engageX = engageLogicalX === null ? null : toScreenX(engageLogicalX);
+      drawUnit(x, midY, u, isMine, engageX);
     }
 
     // update HUD numbers
@@ -350,10 +379,16 @@ const Game = (() => {
     fieldCtx.restore();
   }
 
-  function drawUnit(x, y, u, isMine){
+  function drawUnit(x, y, u, isMine, engageX){
     const def = UNIT_DEFS[u.type];
+    const engaged = engageX !== null && engageX !== undefined;
+    const localTargetX = engaged ? engageX - x : null;
+    const dir = engaged ? (localTargetX >= 0 ? 1 : -1) : (u.side === 'A' ? 1 : -1);
+
     fieldCtx.save();
     fieldCtx.translate(x, y);
+
+    // body
     fieldCtx.fillStyle = def.color;
     fieldCtx.globalAlpha = isMine ? 1 : 0.85;
     fieldCtx.beginPath();
@@ -363,6 +398,62 @@ const Game = (() => {
     fieldCtx.lineWidth = 2;
     fieldCtx.stroke();
     fieldCtx.globalAlpha = 1;
+
+    // weapon (drawn facing `dir`; use a horizontal scale so we only ever
+    // have to write the geometry once, facing right)
+    fieldCtx.save();
+    fieldCtx.scale(dir, 1);
+    if (u.type === 'swordsman') {
+      const swing = engaged ? Math.sin(performance.now() / 90) * 0.5 : 0.08;
+      fieldCtx.save();
+      fieldCtx.rotate(swing);
+      fieldCtx.strokeStyle = '#f2f2f2';
+      fieldCtx.lineWidth = 2.5;
+      fieldCtx.beginPath();
+      fieldCtx.moveTo(def.radius - 2, -2);
+      fieldCtx.lineTo(def.radius + 11, -2);
+      fieldCtx.stroke();
+      fieldCtx.strokeStyle = '#8a5a2a';
+      fieldCtx.lineWidth = 3;
+      fieldCtx.beginPath();
+      fieldCtx.moveTo(def.radius - 4, 2);
+      fieldCtx.lineTo(def.radius + 2, 2);
+      fieldCtx.stroke();
+      fieldCtx.restore();
+    } else if (u.type === 'archer') {
+      fieldCtx.strokeStyle = '#7a4a20';
+      fieldCtx.lineWidth = 2;
+      fieldCtx.beginPath();
+      fieldCtx.arc(def.radius + 2, 0, 6, -Math.PI*0.4, Math.PI*0.4);
+      fieldCtx.stroke();
+      fieldCtx.strokeStyle = '#d9c48a';
+      fieldCtx.lineWidth = 1;
+      fieldCtx.beginPath();
+      fieldCtx.moveTo(def.radius + 2, -5.5);
+      fieldCtx.lineTo(def.radius + 2, 5.5);
+      fieldCtx.stroke();
+    }
+    fieldCtx.restore();
+
+    // flying arrow — archer only, looping over its cooldown so it visibly
+    // travels from the archer to whatever it's currently hitting
+    if (u.type === 'archer' && engaged) {
+      const period = def.cooldown * 1000;
+      const phase = (performance.now() % period) / period;
+      const arrowX = localTargetX * phase;
+      fieldCtx.save();
+      fieldCtx.translate(arrowX, 0);
+      fieldCtx.rotate(dir === 1 ? 0 : Math.PI);
+      fieldCtx.strokeStyle = '#e8d9a0';
+      fieldCtx.lineWidth = 1.5;
+      fieldCtx.beginPath();
+      fieldCtx.moveTo(-7, 0); fieldCtx.lineTo(4, 0); fieldCtx.stroke();
+      fieldCtx.beginPath();
+      fieldCtx.moveTo(4, 0); fieldCtx.lineTo(0, -2.5); fieldCtx.lineTo(0, 2.5); fieldCtx.closePath();
+      fieldCtx.fillStyle = '#e8d9a0'; fieldCtx.fill();
+      fieldCtx.restore();
+    }
+
     // hp sliver
     const w = def.radius*2;
     fieldCtx.fillStyle = '#000'; fieldCtx.fillRect(-w/2, -def.radius-7, w, 3);
@@ -432,7 +523,7 @@ const Game = (() => {
     const dt = Math.min(0.05, (ts - lastT) / 1000);
     lastT = ts;
 
-    if (!paused && !gameOver) {
+    if (started && !paused && !gameOver) {
       dropTimer += dt;
       if (dropTimer >= dropInterval) {
         dropTimer = 0;
@@ -453,9 +544,21 @@ const Game = (() => {
     fieldCv = document.getElementById('battlefield'); fieldCtx = fieldCv.getContext('2d');
 
     nextType = randomPiece();
-    spawnPiece();
+    drawNextPreview();
     setupControls();
     requestAnimationFrame(loop);
+  }
+
+  function resetState(){
+    grid = makeEmptyGrid();
+    sim = { baseA: BASE_MAX_HP, baseB: BASE_MAX_HP, units: [], nextId: 1, over: false, winner: null };
+    lastRemoteState = null;
+    rowsCleared = 0; gameOver = false; paused = false; botTimer = 3;
+    cur = null;
+    document.getElementById('rowsCleared').textContent = 0;
+    document.getElementById('gameOverBanner').classList.add('hidden');
+    nextType = randomPiece();
+    drawNextPreview();
   }
 
   return {
@@ -469,14 +572,19 @@ const Game = (() => {
     getSnapshot,
     applyRemoteState,
     colorToType(color){ return COLOR_TO_TYPE[color]; },
-    restart(){
-      grid = makeEmptyGrid();
-      sim = { baseA: BASE_MAX_HP, baseB: BASE_MAX_HP, units: [], nextId: 1, over: false, winner: null };
-      lastRemoteState = null;
-      rowsCleared = 0; gameOver = false; paused = false; botTimer = 3;
-      document.getElementById('rowsCleared').textContent = 0;
-      document.getElementById('gameOverBanner').classList.add('hidden');
+    // Reset to a clean, idle board and STOP — used the moment a player enters
+    // a host/join room, so nothing falls or fights while still waiting for
+    // an opponent to actually connect.
+    prepare(){
+      resetState();
+      started = false;
+    },
+    // Reset and actually begin ticking — used immediately for solo/bot play,
+    // or once an opponent has connected for host/client play.
+    start(){
+      resetState();
       spawnPiece();
+      started = true;
     }
   };
 })();
