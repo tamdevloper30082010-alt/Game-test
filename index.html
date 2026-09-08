@@ -27,7 +27,14 @@
         </div>
       </div>
 
-      <button id="menuBot" class="btn-tac big">CHƠI VỚI MÁY</button>
+      <div class="menu-bot">
+        <button id="menuBotToggle" class="btn-tac big">CHƠI VỚI MÁY</button>
+        <div id="botPanel" class="join-panel bot-panel hidden">
+          <button class="btn-tac bot-diff" data-diff="easy">DỄ</button>
+          <button class="btn-tac bot-diff" data-diff="medium">THƯỜNG</button>
+          <button class="btn-tac bot-diff" data-diff="hard">KHÓ</button>
+        </div>
+      </div>
     </div>
 
     <div id="homeStatus" class="home-status"></div>
@@ -103,7 +110,9 @@
         <span class="panel-label">CHÚ GIẢI</span>
         <div class="legend-row"><i class="dot red"></i> Kiếm sĩ — cận chiến, máu cao</div>
         <div class="legend-row"><i class="dot blue"></i> Cung thủ — tầm xa, sát thương cao</div>
+        <div class="legend-row"><i class="dot knight"></i> Kỵ sĩ — cưỡi ngựa, tốc độ &amp; tốc đánh cao</div>
       </div>
+      <button id="btnRotate" class="btn-tac small">XOAY</button>
       <button id="btnPause" class="btn-tac small">TẠM DỪNG</button>
     </div>
   </section>
