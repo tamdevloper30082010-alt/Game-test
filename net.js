@@ -22,6 +22,7 @@ const Net = (() => {
   let localStream = null;
   let role = 'solo';        // 'solo' | 'host' | 'client'
   let broadcastTimer = null;
+  let currentRoomCode = null; // room code the client is connecting to (used to place the media call once connected)
 
   const els = {};
 
@@ -115,19 +116,19 @@ const Net = (() => {
     }
   }
 
+  async function toggleTrack(kind){
+    if (!localStream) await ensureLocalMedia();
+    const track = kind === 'audio'
+      ? localStream && localStream.getAudioTracks()[0]
+      : localStream && localStream.getVideoTracks()[0];
+    if (!track) return;
+    track.enabled = !track.enabled;
+    syncMediaButtons();
+  }
+
   function wireMediaButtons(){
-    els.btnMic.addEventListener('click', () => {
-      const track = localStream && localStream.getAudioTracks()[0];
-      if (!track) return;
-      track.enabled = !track.enabled;
-      syncMediaButtons();
-    });
-    els.btnCam.addEventListener('click', () => {
-      const track = localStream && localStream.getVideoTracks()[0];
-      if (!track) return;
-      track.enabled = !track.enabled;
-      syncMediaButtons();
-    });
+    els.btnMic.addEventListener('click', () => toggleTrack('audio'));
+    els.btnCam.addEventListener('click', () => toggleTrack('video'));
   }
 
   // ---------- data channel protocol ----------
@@ -152,10 +153,25 @@ const Net = (() => {
 
   function attachConnHandlers(c){
     conn = c;
-    conn.on('open', () => {
+    conn.on('open', async () => {
       setConnState('online');
       els.roomLabel.textContent = 'ĐÃ KẾT NỐI';
-      if (role === 'host') startBroadcasting();
+
+      // camera/mic are only requested now that a real opponent is connected —
+      // never just from entering the home screen or opening/joining a room
+      await ensureLocalMedia();
+
+      if (role === 'host') {
+        startBroadcasting();
+      } else if (role === 'client' && localStream && localStream.getTracks().length) {
+        mediaCall = peer.call(PEER_PREFIX + currentRoomCode, localStream);
+        mediaCall.on('stream', (remoteStream) => { els.remoteVideo.srcObject = remoteStream; });
+      }
+
+      // the puzzle grid / battle sim only actually starts running once the
+      // opponent has joined — fixes "tạo phòng là chơi luôn" (room used to
+      // start playing immediately instead of waiting for the other player)
+      Game.start();
     });
     conn.on('data', onData);
     conn.on('close', () => {
@@ -191,12 +207,11 @@ const Net = (() => {
     Game.setRole('host', 'A');
     Game.setBotMode(false);
     showGameScreen();
+    Game.prepare(); // idle board — waits for an opponent before anything falls/fights
     setConnState('connecting');
 
     const code = randomRoomCode();
     els.roomLabel.textContent = 'ĐANG MỞ PHÒNG ' + code + '...';
-
-    await ensureLocalMedia();
 
     try {
       peer = new Peer(PEER_PREFIX + code, { config: ICE_CONFIG });
@@ -234,13 +249,13 @@ const Net = (() => {
     }
 
     role = 'client';
+    currentRoomCode = code;
     Game.setRole('client', 'B');
     Game.setBotMode(false);
     showGameScreen();
+    Game.prepare(); // idle board until the connection to the host is actually open
     setConnState('connecting');
     els.roomLabel.textContent = 'ĐANG VÀO PHÒNG ' + code + '...';
-
-    await ensureLocalMedia();
 
     try {
       peer = new Peer({ config: ICE_CONFIG });
@@ -252,10 +267,8 @@ const Net = (() => {
     peer.on('open', () => {
       const c = peer.connect(PEER_PREFIX + code, { reliable: true });
       attachConnHandlers(c);
-      if (localStream && localStream.getTracks().length) {
-        mediaCall = peer.call(PEER_PREFIX + code, localStream);
-        mediaCall.on('stream', (remoteStream) => { els.remoteVideo.srcObject = remoteStream; });
-      }
+      // the media call itself is placed once the data connection opens
+      // and local media has been acquired (see attachConnHandlers)
     });
     peer.on('call', (call) => {
       call.answer(localStream || undefined);
@@ -275,11 +288,11 @@ const Net = (() => {
     Game.setRole('solo', 'A');
     Game.setBotMode(true);
     showGameScreen();
+    Game.start(); // no opponent to wait for — the match begins right away
     setConnState('offline');
     els.roomLabel.textContent = 'CHẾ ĐỘ CHƠI VỚI MÁY';
-    // camera/mic optional in bot mode — try to get it for the self-preview,
-    // but never block starting the match if it fails.
-    ensureLocalMedia();
+    // camera/mic are optional here (there's no remote peer to send them to)
+    // so they're only requested if the player presses CAM/MIC themselves.
   }
 
   function teardown(){
