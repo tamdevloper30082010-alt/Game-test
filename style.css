@@ -175,6 +175,9 @@ img, canvas, video{ max-width:100%; display:block; }
   position:relative;
   background: var(--panel);
   border-bottom:1px solid var(--line);
+  border-left:1px solid var(--line);
+  border-right:1px solid var(--line);
+  margin:0 18px;
   flex: 1 1 auto;
   min-height:120px;
   display:flex; align-items:center; justify-content:center;
@@ -229,12 +232,12 @@ img, canvas, video{ max-width:100%; display:block; }
 #puzzleGrid{
   border:1px solid var(--line);
   background: #05070a;
-  height:100%; max-height:100%; max-width:60%;
+  height:100%; max-height:100%; max-width:74%;
   aspect-ratio: 8 / 10;
   flex: 0 1 auto;
 }
 .puzzle-side-panel{
-  display:flex; flex-direction:column; gap:6px; width:110px; flex:0 0 auto;
+  display:flex; flex-direction:column; gap:6px; width:92px; flex:0 0 auto;
   max-height:100%; overflow:auto;
 }
 .panel-block{
