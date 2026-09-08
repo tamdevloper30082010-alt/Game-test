@@ -141,7 +141,13 @@ const Game = (() => {
   let grid = makeEmptyGrid();      // mỗi ô lưu tên loại lính, BLANK (ô trắng trống), hoặc null (chưa chiếm chỗ)
   let cur = null;                  // current falling piece: { key, cells, types, x, y }
   let nextType = null;             // { key, cells, types }
-  let dropTimer = 0, dropInterval = 0.8;
+  // dropInterval: chậm hơn bản trước (0.8 -> 1.0) để người chơi có thêm thời
+  // gian quan sát/tính toán. LOCK_DELAY: sau khi khối chạm đáy/chồng lên khối
+  // khác, còn thêm nửa giây để dịch/xoay trước khi bị khoá cứng — tránh tình
+  // trạng khối "chốt" ngay lập tức khiến người chơi không kịp chỉnh.
+  let dropTimer = 0, dropInterval = 1.0;
+  let lockTimer = 0;
+  const LOCK_DELAY = 0.5;
   let rowsCleared = 0;
   let paused = false;
   let gameOver = false;
@@ -194,6 +200,7 @@ const Game = (() => {
       types: piece.types.slice(),
       x: Math.floor(COLS / 2) - 2, y: 0
     };
+    lockTimer = 0;
     nextType = randomPiece();
     drawNextPreview();
     if (collides(cur, cur.x, cur.y)) {
@@ -211,6 +218,10 @@ const Game = (() => {
     return false;
   }
 
+  function isGrounded(){
+    return !!cur && collides(cur, cur.x, cur.y + 1);
+  }
+
   function rotate(p){
     // rotate around piece-local center (2,2) for a 4x4 box, classic SRS-lite.
     // `types` stays index-aligned with `cells`, so it doesn't need to change.
@@ -222,6 +233,9 @@ const Game = (() => {
     if (!cur || paused || gameOver) return false;
     if (!collides(cur, cur.x + dx, cur.y + dy)) {
       cur.x += dx; cur.y += dy;
+      // di chuyển ngang trong lúc đang chạm đáy: làm mới khoảng grace, cho
+      // người chơi thêm thời gian chỉnh vị trí thay vì bị khoá ngay.
+      if (dx !== 0 && isGrounded()) lockTimer = 0;
       return true;
     }
     return false;
@@ -233,6 +247,7 @@ const Game = (() => {
     for (const kick of [0, -1, 1, -2, 2]) {
       if (!collides(r, cur.x + kick, cur.y)) {
         cur.cells = r.cells; cur.x += kick;
+        if (isGrounded()) lockTimer = 0;
         return;
       }
     }
@@ -241,7 +256,17 @@ const Game = (() => {
   function hardDrop(){
     if (!cur || paused || gameOver) return;
     while (tryMove(0, 1)) {}
+    lockTimer = 0;
     lockPiece();
+  }
+
+  // vị trí Y mà khối hiện tại sẽ rơi tới nếu thả thẳng xuống — dùng để vẽ
+  // "khối bóng" (ghost piece) cho người chơi biết trước sẽ rơi vào đâu.
+  function ghostDropY(){
+    if (!cur) return 0;
+    let gy = cur.y;
+    while (!collides(cur, cur.x, gy + 1)) gy++;
+    return gy;
   }
 
   function lockPiece(){
@@ -298,6 +323,19 @@ const Game = (() => {
     for (let r = 0; r < ROWS; r++)
       for (let cIdx = 0; cIdx < COLS; cIdx++)
         if (grid[r][cIdx]) drawCell(puzzleCtx, cIdx, r, grid[r][cIdx], c);
+
+    // ghost piece — viền vàng nét đứt cho biết khối sẽ rơi tới đâu nếu thả
+    // thẳng xuống, giúp căn vị trí chính xác hơn nhiều so với đoán bằng mắt.
+    if (cur && !paused) {
+      const gy = ghostDropY();
+      if (gy !== cur.y) {
+        cur.cells.forEach(([cx, cy], i) => {
+          const ggy = gy + cy;
+          if (ggy >= 0) drawGhostCell(puzzleCtx, cur.x + cx, ggy, c);
+        });
+      }
+    }
+
     // current piece
     if (cur) cur.cells.forEach(([cx, cy], i) => {
       if (cur.y + cy >= 0) drawCell(puzzleCtx, cur.x + cx, cur.y + cy, cur.types[i], c);
@@ -311,6 +349,18 @@ const Game = (() => {
       puzzleCtx.textAlign = 'center';
       puzzleCtx.fillText('TẠM DỪNG', puzzleCv.width/2, puzzleCv.height/2);
     }
+  }
+
+  function drawGhostCell(ctx, gx, gy, c){
+    const pad = 1.5;
+    const x = gx*c + pad, y = gy*c + pad, w = c - pad*2, h = c - pad*2;
+    ctx.save();
+    ctx.strokeStyle = '#d9a63e';
+    ctx.globalAlpha = 0.5;
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([3, 2]);
+    ctx.strokeRect(x, y, w, h);
+    ctx.restore();
   }
 
   // ô khối/lưới giờ luôn nền TRẮNG — loại lính (nếu ô đó có lính) chỉ được
@@ -335,69 +385,141 @@ const Game = (() => {
 
   // vẽ một glyph nhỏ đại diện cho từng loại lính, dùng màu gốc của loại đó
   // (đỏ/xanh dương/xanh lá) để vẫn phân biệt được loại lính dù nền ô trắng.
+  // Thiết kế lại để dễ nhận ra ngay ở kích thước nhỏ:
+  //   - Kiếm sĩ: hình người cầm kiếm giơ cao, có cán chắn rõ ràng.
+  //   - Cung thủ: hình người đang giương cung, có dây cung + mũi tên.
+  //   - Kỵ sĩ: hình ngựa nhìn nghiêng (đầu, bờm, 4 chân, đuôi) với người
+  //     cưỡi nhỏ trên lưng và một cây thương chĩa về phía trước.
   function drawUnitIcon(ctx, cx, cy, size, type){
     const def = UNIT_DEFS[type];
-    const s = size * 0.32;
+    const s = size * 0.42;
     ctx.save();
     ctx.translate(cx, cy);
-    ctx.strokeStyle = def.color;
     ctx.fillStyle = def.color;
-    ctx.lineWidth = Math.max(1, size * 0.09);
+    ctx.strokeStyle = def.color;
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
 
     if (type === 'swordsman') {
-      // lưỡi kiếm
+      // đầu
       ctx.beginPath();
-      ctx.moveTo(0, -s*1.3);
-      ctx.lineTo(0, s*0.9);
-      ctx.stroke();
-      // cán chắn ngang
-      ctx.beginPath();
-      ctx.moveTo(-s*0.6, s*0.15);
-      ctx.lineTo(s*0.6, s*0.15);
-      ctx.stroke();
-      // chuôi kiếm
-      ctx.beginPath();
-      ctx.arc(0, s*1.15, s*0.18, 0, Math.PI*2);
+      ctx.arc(-s*0.05, -s*0.85, s*0.28, 0, Math.PI*2);
       ctx.fill();
+      // thân
+      ctx.lineWidth = Math.max(1.4, size * 0.11);
+      ctx.beginPath();
+      ctx.moveTo(-s*0.05, -s*0.58);
+      ctx.lineTo(-s*0.05, s*0.35);
+      ctx.stroke();
+      // 2 chân
+      ctx.beginPath();
+      ctx.moveTo(-s*0.05, s*0.35); ctx.lineTo(-s*0.35, s*0.95);
+      ctx.moveTo(-s*0.05, s*0.35); ctx.lineTo(s*0.2, s*0.95);
+      ctx.stroke();
+      // cánh tay giơ kiếm
+      ctx.beginPath();
+      ctx.moveTo(-s*0.05, -s*0.35);
+      ctx.lineTo(s*0.32, -s*0.18);
+      ctx.stroke();
+      // lưỡi kiếm — nét đậm, chéo lên, dài, dễ nhận ra nhất trong icon
+      ctx.lineWidth = Math.max(1.7, size * 0.14);
+      ctx.beginPath();
+      ctx.moveTo(s*0.3, -s*0.2);
+      ctx.lineTo(s*0.98, -s*1.05);
+      ctx.stroke();
+      // cán chắn ngang (chuôi kiếm)
+      ctx.lineWidth = Math.max(1.2, size * 0.09);
+      ctx.beginPath();
+      ctx.moveTo(s*0.15, -s*0.38);
+      ctx.lineTo(s*0.48, -s*0.02);
+      ctx.stroke();
     } else if (type === 'archer') {
-      // cánh cung
+      // đầu
       ctx.beginPath();
-      ctx.arc(0, 0, s*1.1, -Math.PI*0.35, Math.PI*0.35);
+      ctx.arc(-s*0.15, -s*0.85, s*0.26, 0, Math.PI*2);
+      ctx.fill();
+      // thân
+      ctx.lineWidth = Math.max(1.4, size * 0.11);
+      ctx.beginPath();
+      ctx.moveTo(-s*0.15, -s*0.6);
+      ctx.lineTo(-s*0.15, s*0.35);
       ctx.stroke();
-      // dây cung
+      // 2 chân
       ctx.beginPath();
-      ctx.moveTo(s*0.75, -s*0.85);
-      ctx.lineTo(s*0.75, s*0.85);
+      ctx.moveTo(-s*0.15, s*0.35); ctx.lineTo(-s*0.4, s*0.95);
+      ctx.moveTo(-s*0.15, s*0.35); ctx.lineTo(s*0.05, s*0.95);
       ctx.stroke();
-      // thân mũi tên
+      // cánh cung — cong lớn phía trước người, chi tiết nhận diện chính
+      ctx.lineWidth = Math.max(1.7, size * 0.13);
       ctx.beginPath();
-      ctx.moveTo(-s*0.9, 0);
-      ctx.lineTo(s*0.75, 0);
+      ctx.arc(s*0.35, -s*0.15, s*0.62, -Math.PI*0.42, Math.PI*0.42);
       ctx.stroke();
-      // đầu mũi tên
+      // dây cung kéo về tay
+      ctx.lineWidth = Math.max(1, size * 0.06);
       ctx.beginPath();
-      ctx.moveTo(s*0.75, 0);
-      ctx.lineTo(s*0.35, -s*0.3);
-      ctx.lineTo(s*0.35, s*0.3);
+      ctx.moveTo(s*0.62, -s*0.65);
+      ctx.lineTo(s*0.05, -s*0.15);
+      ctx.lineTo(s*0.62, s*0.35);
+      ctx.stroke();
+      // thân + đầu mũi tên đang lắp sẵn, chĩa về phía trước
+      ctx.lineWidth = Math.max(1.2, size * 0.08);
+      ctx.beginPath();
+      ctx.moveTo(s*0.05, -s*0.15);
+      ctx.lineTo(s*0.85, -s*0.15);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(s*0.85, -s*0.15);
+      ctx.lineTo(s*0.55, -s*0.32);
+      ctx.lineTo(s*0.55, s*0.02);
       ctx.closePath();
       ctx.fill();
     } else if (type === 'knight') {
-      // đầu ngựa cách điệu: thân hình thoi + 2 tai
+      // thân ngựa
       ctx.beginPath();
-      ctx.moveTo(0, -s*1.2);
-      ctx.lineTo(s*0.9, 0);
-      ctx.lineTo(0, s*1.2);
-      ctx.lineTo(-s*0.9, 0);
+      ctx.ellipse(0, s*0.05, s*0.62, s*0.32, 0, 0, Math.PI*2);
+      ctx.fill();
+      // cổ + đầu ngựa vươn về phía trước
+      ctx.beginPath();
+      ctx.moveTo(s*0.45, -s*0.1);
+      ctx.lineTo(s*0.85, -s*0.75);
+      ctx.lineTo(s*1.05, -s*0.55);
+      ctx.lineTo(s*0.65, s*0.05);
       ctx.closePath();
       ctx.fill();
+      // tai
       ctx.beginPath();
-      ctx.moveTo(-s*0.25, -s*1.1);
-      ctx.lineTo(-s*0.05, -s*1.75);
-      ctx.lineTo(s*0.15, -s*1.05);
+      ctx.moveTo(s*0.78, -s*0.62);
+      ctx.lineTo(s*0.9, -s*0.95);
+      ctx.lineTo(s*0.95, -s*0.6);
       ctx.closePath();
       ctx.fill();
+      // 4 chân
+      ctx.lineWidth = Math.max(1.2, size * 0.09);
+      ctx.beginPath();
+      ctx.moveTo(-s*0.4, s*0.32);  ctx.lineTo(-s*0.45, s*0.9);
+      ctx.moveTo(-s*0.1, s*0.34);  ctx.lineTo(-s*0.15, s*0.9);
+      ctx.moveTo(s*0.25, s*0.34);  ctx.lineTo(s*0.3, s*0.9);
+      ctx.moveTo(s*0.5, s*0.28);   ctx.lineTo(s*0.55, s*0.85);
+      ctx.stroke();
+      // đuôi
+      ctx.lineWidth = Math.max(1.2, size * 0.08);
+      ctx.beginPath();
+      ctx.moveTo(-s*0.6, -s*0.05);
+      ctx.quadraticCurveTo(-s*0.95, s*0.15, -s*0.75, s*0.55);
+      ctx.stroke();
+      // người cưỡi trên lưng — thân + đầu nhỏ, để rõ ràng là "cưỡi ngựa"
+      ctx.beginPath();
+      ctx.ellipse(0, -s*0.35, s*0.22, s*0.28, 0, 0, Math.PI*2);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.arc(s*0.02, -s*0.68, s*0.18, 0, Math.PI*2);
+      ctx.fill();
+      // thương chĩa về phía trước
+      ctx.lineWidth = Math.max(1.3, size * 0.09);
+      ctx.beginPath();
+      ctx.moveTo(s*0.2, -s*0.4);
+      ctx.lineTo(s*1.15, -s*0.7);
+      ctx.stroke();
     }
     ctx.restore();
   }
@@ -750,33 +872,51 @@ const Game = (() => {
       else if (e.code === 'Space') { e.preventDefault(); hardDrop(); }
     });
 
+    // Điều khiển chạm: KÉO NGANG để di chuyển khối theo đúng ngón tay (chính
+    // xác hơn nhiều so với vuốt-từng-nấc trước đây), CHẠM NHẸ (không kéo) để
+    // xoay, VUỐT XUỐNG nhanh để rơi cứng.
     let touchStartX = 0, touchStartY = 0, touchStartT = 0;
+    let dragStartPieceX = 0;
+    let dragged = false;
+
     puzzleCv.addEventListener('touchstart', (e) => {
+      if (paused || gameOver || !cur) return;
       const t = e.changedTouches[0];
       touchStartX = t.clientX; touchStartY = t.clientY; touchStartT = Date.now();
+      dragStartPieceX = cur.x;
+      dragged = false;
+    }, { passive: true });
+
+    puzzleCv.addEventListener('touchmove', (e) => {
+      if (paused || gameOver || !cur) return;
+      const t = e.changedTouches[0];
+      const dx = t.clientX - touchStartX;
+      const rect = puzzleCv.getBoundingClientRect();
+      const cellPx = rect.width / COLS;
+      const colDelta = Math.round(dx / cellPx);
+      if (colDelta !== 0) dragged = true;
+      const targetX = dragStartPieceX + colDelta;
+      while (cur.x < targetX && tryMove(1, 0)) {}
+      while (cur.x > targetX && tryMove(-1, 0)) {}
     }, { passive: true });
 
     puzzleCv.addEventListener('touchend', (e) => {
       if (paused || gameOver) return;
       const t = e.changedTouches[0];
-      const dx = t.clientX - touchStartX, dy = t.clientY - touchStartY;
+      const dy = t.clientY - touchStartY;
       const dt = Date.now() - touchStartT;
-      const absX = Math.abs(dx), absY = Math.abs(dy);
 
-      if (absX < 12 && absY < 12) {
-        // tap: left half = move left, right half = move right
-        const rect = puzzleCv.getBoundingClientRect();
-        const tapX = t.clientX - rect.left;
-        if (tapX < rect.width / 2) tryMove(-1, 0); else tryMove(1, 0);
-        return;
+      if (!dragged) {
+        const absY = Math.abs(dy);
+        if (absY < 12) {
+          tryRotate(); // chạm nhẹ, không kéo = xoay
+        } else if (dy > 40 && dt < 500) {
+          hardDrop(); // vuốt xuống nhanh = rơi cứng
+        } else if (dy < -40 && dt < 500) {
+          tryRotate(); // vuốt lên cũng xoay, giữ thói quen cũ
+        }
       }
-      if (absY > absX && dt < 500) {
-        if (dy > 40) hardDrop(); else if (dy < -40) tryRotate();
-        return;
-      }
-      if (absX > absY) {
-        if (dx > 30) tryMove(1, 0); else if (dx < -30) tryMove(-1, 0);
-      }
+      dragged = false;
     }, { passive: true });
 
     document.getElementById('btnPause').addEventListener('click', () => {
@@ -799,10 +939,24 @@ const Game = (() => {
     lastT = ts;
 
     if (started && !paused && !gameOver) {
-      dropTimer += dt;
-      if (dropTimer >= dropInterval) {
-        dropTimer = 0;
-        if (!tryMove(0, 1)) lockPiece();
+      if (cur) {
+        if (isGrounded()) {
+          // khối đã chạm đáy/chồng lên khối khác — cho thêm LOCK_DELAY giây
+          // để người chơi dịch/xoay trước khi thực sự khoá cứng xuống lưới.
+          dropTimer = 0;
+          lockTimer += dt;
+          if (lockTimer >= LOCK_DELAY) {
+            lockTimer = 0;
+            lockPiece();
+          }
+        } else {
+          lockTimer = 0;
+          dropTimer += dt;
+          if (dropTimer >= dropInterval) {
+            dropTimer = 0;
+            tryMove(0, 1);
+          }
+        }
       }
       tickBattle(dt);
     }
@@ -831,6 +985,7 @@ const Game = (() => {
     rowsCleared = 0; gameOver = false; paused = false;
     botTimer = BOT_DIFFICULTY[botDifficulty].minGap;
     cur = null;
+    dropTimer = 0; lockTimer = 0;
     document.getElementById('rowsCleared').textContent = 0;
     document.getElementById('gameOverBanner').classList.add('hidden');
     nextType = randomPiece();
