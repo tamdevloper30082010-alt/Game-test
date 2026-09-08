@@ -50,8 +50,8 @@ const Game = (() => {
   const SPAWN_BUFF_MULT = 1.4;
   const SPAWN_BUFF_MS = 1500;
 
-  // tỉ lệ loại lính được gán cho MỖI Ô của khối rơi (độc lập theo từng ô,
-  // nên một khối có thể chứa nhiều loại lính khác nhau cùng lúc).
+  // tỉ lệ loại lính được gán cho MỖI Ô "có lính" của khối rơi (độc lập theo
+  // từng ô, nên một khối có thể chứa nhiều loại lính khác nhau cùng lúc).
   const CELL_TYPE_WEIGHTS = { swordsman: 1/3, archer: 1/3, knight: 1/3 };
 
   function weightedRandomType(weights){
@@ -64,6 +64,52 @@ const Game = (() => {
     return UNIT_TYPE_KEYS[UNIT_TYPE_KEYS.length - 1];
   }
   function randomCellType(){ return weightedRandomType(CELL_TYPE_WEIGHTS); }
+
+  // ---------- "số ô có lính" trong một khối rơi ----------
+  // Không phải mọi ô của khối đều chứa lính. Mỗi khối rơi random ra "có bao
+  // nhiêu ô có lính" theo phân phối dưới đây (chỉ số mảng = số ô có lính,
+  // giá trị = xác suất) — càng nhiều ô có lính thì xác suất càng thấp.
+  // Khối 4 ô (I/O/T/S/Z/J/L) dùng đúng tỉ lệ yêu cầu: 10% 0 ô, 50% 1 ô,
+  // 20% 2 ô, 15% 3 ô, 5% 4 ô. Các kích thước khối khác (1/2/3/5 ô) suy ra
+  // theo cùng quy luật: đỉnh phân phối ở 1 ô, giảm dần khi số ô tăng.
+  const CELL_FILL_DIST_BY_SIZE = {
+    1: [0.20, 0.80],
+    2: [0.20, 0.60, 0.20],
+    3: [0.15, 0.55, 0.20, 0.10],
+    4: [0.10, 0.50, 0.20, 0.15, 0.05],
+    5: [0.08, 0.45, 0.20, 0.15, 0.08, 0.04]
+  };
+  // giá trị đánh dấu một ô của khối/lưới bị chiếm chỗ (chặn va chạm, tính
+  // để nổ hàng) nhưng KHÔNG có lính bên trong — hiển thị là ô trắng trống.
+  const BLANK = 'blank';
+
+  function pickFilledCellCount(total){
+    const dist = CELL_FILL_DIST_BY_SIZE[total];
+    if (!dist) return total; // fallback an toàn nếu có hình mới chưa khai báo
+    const r = Math.random();
+    let acc = 0;
+    for (let k = 0; k < dist.length; k++) {
+      acc += dist[k];
+      if (r <= acc) return k;
+    }
+    return dist.length - 1;
+  }
+
+  // gán loại lính (hoặc BLANK) cho từng ô của một khối có `total` ô: chọn
+  // ngẫu nhiên vị trí nào có lính theo pickFilledCellCount, các ô còn lại
+  // là BLANK (trắng, trống).
+  function assignCellTypes(total){
+    const filledCount = pickFilledCellCount(total);
+    const indices = Array.from({ length: total }, (_, i) => i);
+    for (let i = indices.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [indices[i], indices[j]] = [indices[j], indices[i]];
+    }
+    const filled = new Set(indices.slice(0, filledCount));
+    const types = new Array(total).fill(BLANK);
+    filled.forEach(i => { types[i] = randomCellType(); });
+    return types;
+  }
 
   // 3 độ khó "chơi với máy": khoảng cách giữa các lần máy triệu hồi quân,
   // và tỉ lệ loại lính máy chọn (khó hơn = triệu hồi nhanh hơn & thiên về
@@ -92,7 +138,7 @@ const Game = (() => {
   const SHAPE_KEYS = Object.keys(SHAPES);
 
   // ---------- state ----------
-  let grid = makeEmptyGrid();      // mỗi ô lưu tên loại lính ('swordsman'/'archer'/'knight') hoặc null
+  let grid = makeEmptyGrid();      // mỗi ô lưu tên loại lính, BLANK (ô trắng trống), hoặc null (chưa chiếm chỗ)
   let cur = null;                  // current falling piece: { key, cells, types, x, y }
   let nextType = null;             // { key, cells, types }
   let dropTimer = 0, dropInterval = 0.8;
@@ -136,7 +182,7 @@ const Game = (() => {
   function randomPiece(){
     const key = SHAPE_KEYS[Math.floor(Math.random() * SHAPE_KEYS.length)];
     const cells = SHAPES[key].map(c => c.slice());
-    const types = cells.map(() => randomCellType());
+    const types = assignCellTypes(cells.length);
     return { key, cells, types };
   }
 
@@ -210,7 +256,9 @@ const Game = (() => {
   function clearFullRows(){
     for (let r = ROWS - 1; r >= 0; r--) {
       if (grid[r].every(c => c)) {
-        const rowTypes = grid[r].slice(); // loại lính của từng ô trong hàng vừa nổ
+        // chỉ những ô THỰC SỰ có lính (khác BLANK) mới triệu hồi ra chiến
+        // trường — ô trắng trống trong hàng vừa nổ không sinh ra lính nào.
+        const rowTypes = grid[r].filter(t => t && t !== BLANK);
         grid.splice(r, 1);
         grid.unshift(new Array(COLS).fill(null));
         rowsCleared++;
@@ -265,16 +313,93 @@ const Game = (() => {
     }
   }
 
+  // ô khối/lưới giờ luôn nền TRẮNG — loại lính (nếu ô đó có lính) chỉ được
+  // vẽ như một hình nhân vật nhỏ (glyph) bên trong, còn ô BLANK là ô trắng
+  // trống hoàn toàn (không có nhân vật).
   function drawCell(ctx, gx, gy, type, c){
-    const def = UNIT_DEFS[type];
     const pad = 1.5;
-    ctx.fillStyle = def.color;
-    ctx.fillRect(gx*c+pad, gy*c+pad, c-pad*2, c-pad*2);
-    ctx.strokeStyle = def.color;
-    ctx.globalAlpha = 0.55;
+    const x = gx*c + pad, y = gy*c + pad, w = c - pad*2, h = c - pad*2;
+
+    ctx.fillStyle = '#f4f6f8';
+    ctx.fillRect(x, y, w, h);
+    ctx.strokeStyle = '#9aa5b0';
+    ctx.globalAlpha = 0.7;
     ctx.lineWidth = 1;
-    ctx.strokeRect(gx*c+pad, gy*c+pad, c-pad*2, c-pad*2);
+    ctx.strokeRect(x, y, w, h);
     ctx.globalAlpha = 1;
+
+    if (type && type !== BLANK && UNIT_DEFS[type]) {
+      drawUnitIcon(ctx, x + w/2, y + h/2, Math.min(w, h), type);
+    }
+  }
+
+  // vẽ một glyph nhỏ đại diện cho từng loại lính, dùng màu gốc của loại đó
+  // (đỏ/xanh dương/xanh lá) để vẫn phân biệt được loại lính dù nền ô trắng.
+  function drawUnitIcon(ctx, cx, cy, size, type){
+    const def = UNIT_DEFS[type];
+    const s = size * 0.32;
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.strokeStyle = def.color;
+    ctx.fillStyle = def.color;
+    ctx.lineWidth = Math.max(1, size * 0.09);
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+
+    if (type === 'swordsman') {
+      // lưỡi kiếm
+      ctx.beginPath();
+      ctx.moveTo(0, -s*1.3);
+      ctx.lineTo(0, s*0.9);
+      ctx.stroke();
+      // cán chắn ngang
+      ctx.beginPath();
+      ctx.moveTo(-s*0.6, s*0.15);
+      ctx.lineTo(s*0.6, s*0.15);
+      ctx.stroke();
+      // chuôi kiếm
+      ctx.beginPath();
+      ctx.arc(0, s*1.15, s*0.18, 0, Math.PI*2);
+      ctx.fill();
+    } else if (type === 'archer') {
+      // cánh cung
+      ctx.beginPath();
+      ctx.arc(0, 0, s*1.1, -Math.PI*0.35, Math.PI*0.35);
+      ctx.stroke();
+      // dây cung
+      ctx.beginPath();
+      ctx.moveTo(s*0.75, -s*0.85);
+      ctx.lineTo(s*0.75, s*0.85);
+      ctx.stroke();
+      // thân mũi tên
+      ctx.beginPath();
+      ctx.moveTo(-s*0.9, 0);
+      ctx.lineTo(s*0.75, 0);
+      ctx.stroke();
+      // đầu mũi tên
+      ctx.beginPath();
+      ctx.moveTo(s*0.75, 0);
+      ctx.lineTo(s*0.35, -s*0.3);
+      ctx.lineTo(s*0.35, s*0.3);
+      ctx.closePath();
+      ctx.fill();
+    } else if (type === 'knight') {
+      // đầu ngựa cách điệu: thân hình thoi + 2 tai
+      ctx.beginPath();
+      ctx.moveTo(0, -s*1.2);
+      ctx.lineTo(s*0.9, 0);
+      ctx.lineTo(0, s*1.2);
+      ctx.lineTo(-s*0.9, 0);
+      ctx.closePath();
+      ctx.fill();
+      ctx.beginPath();
+      ctx.moveTo(-s*0.25, -s*1.1);
+      ctx.lineTo(-s*0.05, -s*1.75);
+      ctx.lineTo(s*0.15, -s*1.05);
+      ctx.closePath();
+      ctx.fill();
+    }
+    ctx.restore();
   }
 
   function drawNextPreview(){
@@ -282,9 +407,20 @@ const Game = (() => {
     const c = 18;
     const offX = (nextCv.width - 4*c) / 2, offY = (nextCv.height - 4*c) / 2;
     nextType.cells.forEach(([cx, cy], i) => {
-      const def = UNIT_DEFS[nextType.types[i]];
-      nextCtx.fillStyle = def.color;
-      nextCtx.fillRect(offX + cx*c + 1, offY + cy*c + 1, c-2, c-2);
+      const type = nextType.types[i];
+      const x = offX + cx*c + 1, y = offY + cy*c + 1, w = c - 2, h = c - 2;
+
+      nextCtx.fillStyle = '#f4f6f8';
+      nextCtx.fillRect(x, y, w, h);
+      nextCtx.strokeStyle = '#9aa5b0';
+      nextCtx.globalAlpha = 0.7;
+      nextCtx.lineWidth = 1;
+      nextCtx.strokeRect(x, y, w, h);
+      nextCtx.globalAlpha = 1;
+
+      if (type && type !== BLANK && UNIT_DEFS[type]) {
+        drawUnitIcon(nextCtx, x + w/2, y + h/2, Math.min(w, h), type);
+      }
     });
   }
 
